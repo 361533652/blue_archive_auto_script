@@ -52,6 +52,10 @@
 * 双击 `Start_BAAS.bat`（推荐）→ 同步 → 启动；
 * 双击官方 `BlueArchiveAutoScript*.exe` → 它自己的更新（`dev=true` 时跳过）→ 启动 `window.py` → 同步。
 
+**每次同步都往 `log/sync_upstream.log` 追加一份带时间戳的记录。**
+控制台看得到就直接看，看不到（exe 窗口一闪就关、pythonw 没有控制台）就翻这个文件，
+一眼能看出这次启动到底合并了什么、有没有推送。
+
 ## 4. 冲突了怎么办
 
 启动会被拦下来，GUI 会弹框提示，报告在 `log/sync_upstream_conflict.log`。

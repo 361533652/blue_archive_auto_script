@@ -26,6 +26,9 @@
 用法::
 
     python deploy/sync_upstream.py     # 退出码 0 表示可继续启动，1 表示冲突阻断
+
+每次运行都会往 ``log/sync_upstream.log`` 追加一份带时间戳的记录：GUI 由
+pythonw 拉起时控制台不可见，启动器 exe 的控制台也一闪就关，不落盘等于没记录。
 """
 
 import os
@@ -54,7 +57,10 @@ ORIGIN_NAME = "origin"
 STASH_MESSAGE = "auto-sync-pre-stash"
 # 合并前的本地 HEAD 备份引用（滚动覆盖，配合 reflog 使用）
 BACKUP_REF = "refs/baas-backup/auto-sync"
-# 冲突报告落盘位置（相对仓库根目录）：pythonw 启动时控制台不可见
+# 每次同步的运行日志（相对仓库根目录）：GUI 由 pythonw 拉起时控制台不可见，
+# 启动器 exe 的控制台也会一闪就关，不落盘就等于没记录
+RUN_LOG_PATH = os.path.join("log", "sync_upstream.log")
+# 冲突报告落盘位置（相对仓库根目录）
 CONFLICT_LOG_PATH = os.path.join("log", "sync_upstream_conflict.log")
 
 # 本次同步的目标仓库目录；None 表示使用当前工作目录
@@ -62,6 +68,65 @@ _REPO_DIR: Optional[str] = None
 
 # 最近一次同步检测到的冲突文件（供调用方写日志或弹窗展示）
 LAST_CONFLICTS: List[str] = []
+
+# 运行日志的绝对路径；定位到仓库根目录之前先缓冲在内存里
+_LOG_PATH: Optional[str] = None
+_PENDING_LINES: List[str] = []
+
+
+def _log_path_for(root: str) -> str:
+    """给出仓库根目录下的运行日志路径。
+
+    Args:
+        root: 仓库根目录。
+
+    Returns:
+        str: 日志文件绝对路径。
+    """
+    return os.path.join(root, RUN_LOG_PATH)
+
+
+def set_log_path(root: Optional[str]) -> None:
+    """绑定运行日志文件，并把此前缓冲的行补写进去。
+
+    Args:
+        root: 仓库根目录；None 表示不写文件（只打控制台）。
+    """
+    global _LOG_PATH
+    if root is None:
+        _LOG_PATH = None
+        _PENDING_LINES.clear()
+        return
+    _LOG_PATH = _log_path_for(root)
+    for line in _PENDING_LINES:
+        say(line)
+    _PENDING_LINES.clear()
+
+
+def say(message: str = "") -> None:
+    """输出一行日志：控制台（可用时）与 ``log/sync_upstream.log`` 各一份。
+
+    ``pythonw.exe`` 或没有控制台的宿主下 ``sys.stdout`` 可能不可写，任何一次
+    输出失败都不能把启动流程带崩，因此这里全部吞掉异常。
+
+    Args:
+        message: 要输出的内容。
+    """
+    try:
+        print(message)
+    except Exception:
+        pass
+
+    target = _LOG_PATH
+    if target is None:
+        _PENDING_LINES.append(message)
+        return
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+    except Exception:
+        pass
 
 
 def run_git(
@@ -144,10 +209,10 @@ def ensure_upstream() -> bool:
     """
     if UPSTREAM_NAME in get_remote_names():
         return True
-    print(f"[Sync] 未检测到 {UPSTREAM_NAME} 远程源，正在添加 {UPSTREAM_URL} ...")
+    say(f"[Sync] 未检测到 {UPSTREAM_NAME} 远程源，正在添加 {UPSTREAM_URL} ...")
     added = run_git(["git", "remote", "add", UPSTREAM_NAME, UPSTREAM_URL])
     if added.returncode != 0:
-        print(f"[Sync] 添加 {UPSTREAM_NAME} 失败：{(added.stderr or '').strip()}")
+        say(f"[Sync] 添加 {UPSTREAM_NAME} 失败：{(added.stderr or '').strip()}")
         return False
     return True
 
@@ -229,7 +294,7 @@ def backup_head() -> None:
     """
     res = run_git(["git", "update-ref", BACKUP_REF, "HEAD"])
     if res.returncode == 0:
-        print(f"[Sync] 已把当前 HEAD 备份到 {BACKUP_REF}")
+        say(f"[Sync] 已把当前 HEAD 备份到 {BACKUP_REF}")
 
 
 def push_to_origin(branch: Optional[str] = None) -> bool:
@@ -242,23 +307,23 @@ def push_to_origin(branch: Optional[str] = None) -> bool:
         bool: 已推送、无需推送或推送成功返回 True；推送失败返回 False。
     """
     if not has_origin_remote():
-        print(f"[Sync] 未配置 {ORIGIN_NAME} 远程源，跳过推送（更新保留在本地）。")
+        say(f"[Sync] 未配置 {ORIGIN_NAME} 远程源，跳过推送（更新保留在本地）。")
         return False
 
     branch = branch or get_current_branch()
     if not is_local_ahead_of_origin(branch):
-        print(f"[Sync] {ORIGIN_NAME}/{branch} 已是最新，无需推送。")
+        say(f"[Sync] {ORIGIN_NAME}/{branch} 已是最新，无需推送。")
         return True
 
-    print(f"[Sync] 本地领先 {ORIGIN_NAME}/{branch}，正在推送...")
+    say(f"[Sync] 本地领先 {ORIGIN_NAME}/{branch}，正在推送...")
     push_res = run_git(["git", "push", ORIGIN_NAME, branch])
     if push_res.returncode == 0:
-        print("[Sync] 个人 Fork 仓库已同步更新至最新。")
+        say("[Sync] 个人 Fork 仓库已同步更新至最新。")
         return True
     detail = (push_res.stderr or push_res.stdout or "").strip().splitlines()
     if detail:
-        print(f"[Sync] 推送至 {ORIGIN_NAME} 失败：{detail[-1]}")
-    print(
+        say(f"[Sync] 推送至 {ORIGIN_NAME} 失败：{detail[-1]}")
+    say(
         f"[Sync] 推送未完成（网络波动或权限问题），"
         f"更新已保留在本地，下次启动会自动重试推送。"
     )
@@ -292,10 +357,10 @@ def write_conflict_log(conflicts: List[str]) -> Optional[str]:
                 "放弃合并用 git merge --abort；"
                 f"合并前的 HEAD 备份在 {BACKUP_REF}\n\n"
             )
-        print(f"[Sync] 冲突报告已写入 {log_path}")
+        say(f"[Sync] 冲突报告已写入 {log_path}")
         return log_path
     except Exception as e:
-        print(f"[Sync] 写冲突日志失败：{e}")
+        say(f"[Sync] 写冲突日志失败：{e}")
         return None
 
 
@@ -311,18 +376,18 @@ def merge_ref(ref: str, message: str) -> "tuple[bool, List[str]]":
     """
     pending = run_git(["git", "log", f"HEAD..{ref}", "--oneline"]).stdout.strip()
     if not pending:
-        print(f"[Sync] {ref} 已是最新，无需合并。")
+        say(f"[Sync] {ref} 已是最新，无需合并。")
         return True, []
 
     count = len(pending.splitlines())
-    print(f"[Sync] 发现 {ref} 的 {count} 个新提交，正在合并...")
+    say(f"[Sync] 发现 {ref} 的 {count} 个新提交，正在合并...")
     # 合并前留一次本地备份，出错时可以回到合并前的 HEAD
     backup_head()
     merge_res = run_git(["git", "merge", ref, "--no-edit", "-m", message])
     conflicts = get_conflicted_files()
     if merge_res.returncode != 0 or conflicts:
         return False, conflicts
-    print(f"[Sync] {ref} 合并成功。")
+    say(f"[Sync] {ref} 合并成功。")
     return True, []
 
 
@@ -332,24 +397,24 @@ def _print_conflict_report(conflicts: List[str]) -> None:
     Args:
         conflicts: 冲突文件列表。
     """
-    print("\n" + "!" * 64)
-    print("【BAAS 启动拦截】检测到与官方上游仓库存在代码冲突！")
-    print("!" * 64)
-    print("合并已被暂停，冲突文件列表如下：")
+    say("\n" + "!" * 64)
+    say("【BAAS 启动拦截】检测到与官方上游仓库存在代码冲突！")
+    say("!" * 64)
+    say("合并已被暂停，冲突文件列表如下：")
     for path in conflicts:
-        print(f"   x {path}")
-    print("")
-    print("已安全阻断启动，保护本地代码环境。")
-    print("排查要点：")
-    print("   1. git status                 查看冲突文件")
-    print("   2. git show :1:<file>         冲突前的共同祖先")
-    print("      git show :2:<file>         本地（Fork）一侧")
-    print("      git show :3:<file>         官方（upstream）一侧")
-    print("   3. 两边功能都要保留，改完后 git add <file> && git commit")
-    print("   4. 若想放弃本次合并：git merge --abort")
-    print("   5. 未提交的本地改动可能暂存在 git stash 中，见 git stash list")
-    print(f"   6. 合并前的本地 HEAD 备份在 {BACKUP_REF}")
-    print("!" * 64 + "\n")
+        say(f"   x {path}")
+    say("")
+    say("已安全阻断启动，保护本地代码环境。")
+    say("排查要点：")
+    say("   1. git status                 查看冲突文件")
+    say("   2. git show :1:<file>         冲突前的共同祖先")
+    say("      git show :2:<file>         本地（Fork）一侧")
+    say("      git show :3:<file>         官方（upstream）一侧")
+    say("   3. 两边功能都要保留，改完后 git add <file> && git commit")
+    say("   4. 若想放弃本次合并：git merge --abort")
+    say("   5. 未提交的本地改动可能暂存在 git stash 中，见 git stash list")
+    say(f"   6. 合并前的本地 HEAD 备份在 {BACKUP_REF}")
+    say("!" * 64 + "\n")
 
 
 def sync_with_upstream(repo_dir: Optional[str] = None) -> bool:
@@ -366,41 +431,42 @@ def sync_with_upstream(repo_dir: Optional[str] = None) -> bool:
     global LAST_CONFLICTS
 
     LAST_CONFLICTS = []
-    print("=" * 60)
-    print("[BAAS] 启动前检查：正在同步官方上游代码...")
-    print("=" * 60)
+    say("=" * 60)
+    say("[BAAS] 启动前检查：正在同步官方上游代码...")
+    say("=" * 60)
 
     root = find_repo_root(repo_dir)
     if root is None:
-        print(f"[Sync] {repo_dir or os.getcwd()} 不是 Git 仓库，跳过上游同步。")
+        say(f"[Sync] {repo_dir or os.getcwd()} 不是 Git 仓库，跳过上游同步。")
         return True
     _REPO_DIR = root
-    print(f"[Sync] 仓库目录: {root}")
+    set_log_path(root)
+    say(f"[Sync] 仓库目录: {root}")
 
     try:
         if not ensure_upstream():
-            print(f"[Sync] 配置 {UPSTREAM_NAME} 远程仓库失败，跳过同步继续启动。")
+            say(f"[Sync] 配置 {UPSTREAM_NAME} 远程仓库失败，跳过同步继续启动。")
             return True
 
         branch = get_current_branch()
-        print(f"[Sync] 当前分支: {branch}")
+        say(f"[Sync] 当前分支: {branch}")
 
         has_stash = False
         merge_conflicted = False
         if check_dirty_worktree():
-            print("[Sync] 检测到工作区有未提交的代码改动，正在自动创建临时暂存...")
+            say("[Sync] 检测到工作区有未提交的代码改动，正在自动创建临时暂存...")
             stash_res = run_git(["git", "stash", "push", "-m", STASH_MESSAGE])
             has_stash = "Saved working directory" in stash_res.stdout
 
         try:
-            print(f"[Sync] 正在拉取官方上游最新状态 (git fetch {UPSTREAM_NAME})...")
+            say(f"[Sync] 正在拉取官方上游最新状态 (git fetch {UPSTREAM_NAME})...")
             upstream_ref = f"{UPSTREAM_NAME}/{branch}"
             fetch_res = run_git(["git", "fetch", UPSTREAM_NAME])
             upstream_reachable = fetch_res.returncode == 0
             if not upstream_reachable:
-                print("[Sync] 无法连接到上游仓库（可能网络波动），本次只与个人 Fork 对齐。")
+                say("[Sync] 无法连接到上游仓库（可能网络波动），本次只与个人 Fork 对齐。")
             if has_origin_remote():
-                print(f"[Sync] 正在拉取个人 Fork 最新状态 (git fetch {ORIGIN_NAME})...")
+                say(f"[Sync] 正在拉取个人 Fork 最新状态 (git fetch {ORIGIN_NAME})...")
                 run_git(["git", "fetch", ORIGIN_NAME])
 
             # 先对自己的发行版（Fork）对齐，再吸收官方增量。
@@ -416,7 +482,7 @@ def sync_with_upstream(repo_dir: Optional[str] = None) -> bool:
                         (upstream_ref, f"merge: 同步官方 {upstream_ref} 更新")
                     )
                 else:
-                    print(f"[Sync] 上游不存在对应分支 {upstream_ref}，跳过与上游的合并。")
+                    say(f"[Sync] 上游不存在对应分支 {upstream_ref}，跳过与上游的合并。")
 
             for ref, message in merge_targets:
                 ok, conflicts = merge_ref(ref, message)
@@ -436,13 +502,14 @@ def sync_with_upstream(repo_dir: Optional[str] = None) -> bool:
             # 冲突未解决时不能 pop：工作区正处于合并中间态，恢复了也无法编译。
             # 暂存条目会完整保留，排错时可用 `git stash list` 找回。
             if has_stash and not merge_conflicted:
-                print("[Sync] 正在恢复之前未提交的修改 (git stash pop)...")
+                say("[Sync] 正在恢复之前未提交的修改 (git stash pop)...")
                 run_git(["git", "stash", "pop"])
                 if get_conflicted_files():
-                    print("[Sync] 恢复工作区修改时产生局部冲突，请查看相应文件！")
+                    say("[Sync] 恢复工作区修改时产生局部冲突，请查看相应文件！")
             elif has_stash and merge_conflicted:
-                print("[Sync] 未提交的改动已保留在 git stash 中（合并冲突未解决，暂不恢复）。")
+                say("[Sync] 未提交的改动已保留在 git stash 中（合并冲突未解决，暂不恢复）。")
     finally:
+        set_log_path(None)
         _REPO_DIR = None
 
 
