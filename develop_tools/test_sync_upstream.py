@@ -156,6 +156,28 @@ class SyncUpstreamTests(unittest.TestCase):
         self.assertEqual(git(self.local, "rev-parse", module.BACKUP_REF), before)
         self.assertNotEqual(self.local_head(), before, "合并后 HEAD 应前进")
 
+    def test_aligns_with_fork_before_merging_upstream(self):
+        """另一台机器推了 Fork：本地先与 Fork 对齐，没有再吸收官方增量。"""
+        module = load_sync_module()
+
+        # 另一台机器往 Fork 推一个提交
+        other = self.tmp / "other-machine"
+        git(self.tmp, "clone", str(self.fork), str(other))
+        write(other / "from_pc2.txt", "pushed elsewhere\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-m", "pc2: fork only commit")
+        git(other, "push", "origin", "master")
+
+        self.upstream_commit("b.txt", "from upstream\n")
+
+        self.assertTrue(module.sync_with_upstream(str(self.local)))
+
+        self.assertTrue(
+            (self.local / "from_pc2.txt").is_file(), "Fork 上的提交应被收下"
+        )
+        self.assertTrue((self.local / "b.txt").is_file(), "官方增量也要合并进来")
+        self.assertEqual(self.local_head(), self.fork_head())
+
     def test_no_op_when_up_to_date(self):
         """已是最新时：不报错、不产生新提交。"""
         module = load_sync_module()

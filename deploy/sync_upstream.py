@@ -1,7 +1,12 @@
 """上游官方仓库自动同步器。
 
-在启动时把 upstream（官方仓库）的最新代码合并进当前分支，并把结果推送到
-个人的 Fork 仓库（origin）。若检测到代码冲突，立即阻断启动并输出排查指引。
+启动时按两步把代码带到位，然后推送到个人的 Fork 仓库（origin）：
+
+1. 与个人 Fork 对齐（``origin/<分支>``）——Fork 才是这台机器的发行版，
+   另一台机器推了东西进来时要先收下；
+2. 合并官方上游（``upstream/<分支>``）的增量。
+
+两步出现代码冲突都会立即阻断启动并输出排查指引。
 
 设计约束
 --------
@@ -179,6 +184,18 @@ def has_origin_remote() -> bool:
     return ORIGIN_NAME in get_remote_names()
 
 
+def _ref_exists(ref: str) -> bool:
+    """判断本地是否存在该引用（如 ``origin/master``）。
+
+    Args:
+        ref: 引用名。
+
+    Returns:
+        bool: 存在返回 True。
+    """
+    return run_git(["git", "rev-parse", "--verify", "--quiet", ref]).returncode == 0
+
+
 def is_local_ahead_of_origin(branch: Optional[str] = None) -> bool:
     """判断本地分支是否存在尚未推送到 origin 的提交。
 
@@ -197,11 +214,9 @@ def is_local_ahead_of_origin(branch: Optional[str] = None) -> bool:
         return False
     branch = branch or get_current_branch()
     remote_ref = f"{ORIGIN_NAME}/{branch}"
-    if run_git(["git", "rev-parse", "--verify", "--quiet", remote_ref]).returncode != 0:
+    if not _ref_exists(remote_ref):
         # origin 上还没有这个分支：本地提交全部算领先，推送时会新建分支。
-        return (
-            run_git(["git", "rev-parse", "--verify", "--quiet", "HEAD"]).returncode == 0
-        )
+        return _ref_exists("HEAD")
     res = run_git(["git", "log", f"{remote_ref}..HEAD", "--oneline"])
     return bool(res.stdout.strip())
 
@@ -284,6 +299,33 @@ def write_conflict_log(conflicts: List[str]) -> Optional[str]:
         return None
 
 
+def merge_ref(ref: str, message: str) -> "tuple[bool, List[str]]":
+    """把 ``ref`` 合并进当前分支。
+
+    Args:
+        ref: 形如 ``upstream/master`` 的引用名。
+        message: 合并提交的说明。
+
+    Returns:
+        tuple[bool, List[str]]: 是否成功，以及冲突文件列表（成功时为空）。
+    """
+    pending = run_git(["git", "log", f"HEAD..{ref}", "--oneline"]).stdout.strip()
+    if not pending:
+        print(f"[Sync] {ref} 已是最新，无需合并。")
+        return True, []
+
+    count = len(pending.splitlines())
+    print(f"[Sync] 发现 {ref} 的 {count} 个新提交，正在合并...")
+    # 合并前留一次本地备份，出错时可以回到合并前的 HEAD
+    backup_head()
+    merge_res = run_git(["git", "merge", ref, "--no-edit", "-m", message])
+    conflicts = get_conflicted_files()
+    if merge_res.returncode != 0 or conflicts:
+        return False, conflicts
+    print(f"[Sync] {ref} 合并成功。")
+    return True, []
+
+
 def _print_conflict_report(conflicts: List[str]) -> None:
     """打印醒目的冲突阻断报告。
 
@@ -352,49 +394,38 @@ def sync_with_upstream(repo_dir: Optional[str] = None) -> bool:
 
         try:
             print(f"[Sync] 正在拉取官方上游最新状态 (git fetch {UPSTREAM_NAME})...")
+            upstream_ref = f"{UPSTREAM_NAME}/{branch}"
             fetch_res = run_git(["git", "fetch", UPSTREAM_NAME])
-            if fetch_res.returncode != 0:
-                print("[Sync] 无法连接到上游仓库（可能网络波动），本次跳过合并。")
-            else:
+            upstream_reachable = fetch_res.returncode == 0
+            if not upstream_reachable:
+                print("[Sync] 无法连接到上游仓库（可能网络波动），本次只与个人 Fork 对齐。")
+            if has_origin_remote():
                 print(f"[Sync] 正在拉取个人 Fork 最新状态 (git fetch {ORIGIN_NAME})...")
-                if has_origin_remote():
-                    run_git(["git", "fetch", ORIGIN_NAME])
+                run_git(["git", "fetch", ORIGIN_NAME])
 
-                upstream_ref = f"{UPSTREAM_NAME}/{branch}"
-                if run_git(
-                    ["git", "rev-parse", "--verify", "--quiet", upstream_ref]
-                ).returncode != 0:
-                    print(f"[Sync] 上游不存在对应分支 {upstream_ref}，跳过合并。")
+            # 先对自己的发行版（Fork）对齐，再吸收官方增量。
+            merge_targets = []
+            origin_ref = f"{ORIGIN_NAME}/{branch}"
+            if has_origin_remote() and _ref_exists(origin_ref):
+                merge_targets.append(
+                    (origin_ref, f"merge: 同步个人 Fork {origin_ref} 更新")
+                )
+            if upstream_reachable:
+                if _ref_exists(upstream_ref):
+                    merge_targets.append(
+                        (upstream_ref, f"merge: 同步官方 {upstream_ref} 更新")
+                    )
                 else:
-                    new_commits = run_git(
-                        ["git", "log", f"HEAD..{upstream_ref}", "--oneline"]
-                    ).stdout.strip()
-                    if not new_commits:
-                        print(
-                            f"[Sync] 当前分支已包含官方 {upstream_ref} 的所有最新代码，无需合并。"
-                        )
-                    else:
-                        count = len(new_commits.splitlines())
-                        print(f"[Sync] 发现官方最新更新（{count} 个提交），正在合并至本地...")
-                        backup_head()
-                        merge_res = run_git(
-                            [
-                                "git",
-                                "merge",
-                                upstream_ref,
-                                "--no-edit",
-                                "-m",
-                                f"merge: 同步官方 {upstream_ref} 更新",
-                            ]
-                        )
-                        conflicts = get_conflicted_files()
-                        if merge_res.returncode != 0 or conflicts:
-                            merge_conflicted = True
-                            LAST_CONFLICTS = conflicts
-                            write_conflict_log(conflicts)
-                            _print_conflict_report(conflicts)
-                            return False
-                        print("[Sync] 成功合并官方更新。")
+                    print(f"[Sync] 上游不存在对应分支 {upstream_ref}，跳过与上游的合并。")
+
+            for ref, message in merge_targets:
+                ok, conflicts = merge_ref(ref, message)
+                if not ok:
+                    merge_conflicted = True
+                    LAST_CONFLICTS = conflicts
+                    write_conflict_log(conflicts)
+                    _print_conflict_report(conflicts)
+                    return False
 
             # 合并与否都要尝试推送：上一次推送失败时，合并结果仍留在本地，
             # 这里负责在下次启动把它补推到 Fork。
