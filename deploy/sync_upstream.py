@@ -86,6 +86,23 @@ def _log_path_for(root: str) -> str:
     return os.path.join(root, RUN_LOG_PATH)
 
 
+def _write_log_line(message: str) -> None:
+    """把一行追加进运行日志文件（不碰控制台）。
+
+    Args:
+        message: 要写入的内容。
+    """
+    target = _LOG_PATH
+    if target is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+    except Exception:
+        pass
+
+
 def set_log_path(root: Optional[str]) -> None:
     """绑定运行日志文件，并把此前缓冲的行补写进去。
 
@@ -98,8 +115,9 @@ def set_log_path(root: Optional[str]) -> None:
         _PENDING_LINES.clear()
         return
     _LOG_PATH = _log_path_for(root)
+    # 补写缓冲行时只落文件：这些行早就打到控制台了，再打一遍就是重复输出
     for line in _PENDING_LINES:
-        say(line)
+        _write_log_line(line)
     _PENDING_LINES.clear()
 
 
@@ -117,16 +135,10 @@ def say(message: str = "") -> None:
     except Exception:
         pass
 
-    target = _LOG_PATH
-    if target is None:
+    if _LOG_PATH is None:
         _PENDING_LINES.append(message)
         return
-    try:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
-    except Exception:
-        pass
+    _write_log_line(message)
 
 
 def run_git(
