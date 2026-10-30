@@ -42,6 +42,7 @@ import zipfile
 import tempfile
 import platform
 import subprocess
+import importlib.util
 from enum import Enum, auto
 from pathlib import Path
 
@@ -75,6 +76,10 @@ os.environ["PDM_IGNORE_ACTIVE_VENV"] = "1"
 DEFAULT_SETTINGS = {
     "General": {
         "mirrorc_cdk": "",
+        # 个人 Fork 地址。留空时完全保持官方行为（origin 指向 U.REPO_URL_HTTP）；
+        # 填写后 origin 固定指向该 Fork：本机以 Fork 为发行版，官方仓库只作为
+        # upstream 增量来源，由 deploy/sync_upstream.py 在启动时合并进来。
+        "fork_repo_url": "",
         "current_BAAS_version": "",
         "current_BAAS_Cpp_version": "",
         "get_remote_sha_method": "",
@@ -125,6 +130,35 @@ update_type = None
 mirrorc_cdk = None
 latest_mirrorc_return = None
 mirrorc_inst = MirrorC_Updater(app="BAAS_repo", current_version="")
+
+
+def list_remote_heads(remote):
+    """列出远端分支，返回 ``{refname: sha}``。
+
+    兼容 pygit2 两代 API：1.20 起用 ``Remote.list_heads()``（返回 RemoteHead
+    对象），更早版本用 ``Remote.ls_remotes()``（返回 dict）。官方原有的
+    ``pygit2_get_latest_sha`` 只认旧 API，在 pygit2>=1.20 上会抛
+    AttributeError，顺手一并兼容。
+
+    Args:
+        remote: pygit2 的 Remote 对象。
+
+    Returns:
+        dict: 引用名到 SHA 的映射。
+    """
+    heads = {}
+    if hasattr(remote, "list_heads"):
+        for head in remote.list_heads():
+            if isinstance(head, dict):
+                name, oid = head.get("name"), head.get("oid")
+            else:
+                name, oid = getattr(head, "name", None), getattr(head, "oid", None)
+            if name is not None and oid is not None:
+                heads[name] = str(oid)
+        return heads
+    for head in remote.ls_remotes():
+        heads[head["name"]] = str(head["oid"])
+    return heads
 
 
 class Utils:
@@ -179,15 +213,11 @@ class Utils:
         branch = data["branch"]
         remote = repo.remotes.create_anonymous(url)
         try:
-            remote_refs = remote.ls_remotes()
+            heads = list_remote_heads(remote)
         except pygit2.GitError as e:
             logger.warning(f"[PyGit2] get SHA error: {e}")
             return None
-        target_ref = f"refs/heads/{branch}"
-        for ref in remote_refs:
-            if ref["name"] == target_ref:
-                return str(ref["oid"])
-        return None
+        return heads.get(f"refs/heads/{branch}")
 
     @staticmethod
     def get_remote_sha():
@@ -847,7 +877,9 @@ def repair_broken_git_repo():
 
     # Clone the repository to a temporary directory
     logger.info("Cloning fresh repo to temporary directory...")
-    repo = clone_repo(U.REPO_URL_HTTP, str(temp_clone_path))
+    repo = clone_preferred_repo(str(temp_clone_path))
+    if repo is None:
+        raise RuntimeError("Failed to clone repository from all known URLs.")
 
     # Release the occupation of the directory
     del repo
@@ -873,7 +905,6 @@ def git_install_baas():
     logger.info("|       GIT INSTALL BAAS         |")
     logger.info("+--------------------------------+")
     logger.info("Cloning the repository...")
-    logger.info("Repo URL : " + U.REPO_URL_HTTP)
     temp_clone_path = BAAS_ROOT_PATH / "temp_clone"
 
     if temp_clone_path.exists():
@@ -881,10 +912,9 @@ def git_install_baas():
         shutil.rmtree(str(temp_clone_path), ignore_errors=False, onerror=Utils.on_rm_error)
 
     # Clone the repository using pygit2
-    repo = clone_repo(
-        U.REPO_URL_HTTP,
-        str(temp_clone_path),
-    )
+    repo = clone_preferred_repo(str(temp_clone_path))
+    if repo is None:
+        raise RuntimeError("Failed to clone repository from all known URLs.")
 
     # Release the occupation of the directory
     del repo
@@ -899,12 +929,164 @@ def git_install_baas():
     logger.success("Git Install Success!")
 
 
+def get_repo_root_path():
+    """返回安装/仓库根目录。
+
+    installer.py 位于 deploy/installer/ 下：冻结成 exe 后根目录就是 exe 所在
+    目录，源码运行时则取配置的 BAAS_ROOT_PATH，未配置才回退到上两级目录。
+
+    Returns:
+        Path: 仓库根目录。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.argv[0]).resolve().parent
+    if P.BAAS_ROOT_PATH:
+        return Path(P.BAAS_ROOT_PATH).resolve()
+    return Path(__file__).resolve().parents[2]
+
+
+def load_sync_upstream():
+    """按文件路径加载仓库根目录下的 deploy/sync_upstream.py。
+
+    同步模块放在仓库根的 deploy/ 下，而 installer 在 deploy/installer/ 下运行，
+    普通 import 拿不到它；这里按路径加载，冻结场景同样有效（模块只用标准库）。
+
+    Returns:
+        模块对象 | None: 文件缺失或加载失败时返回 None。
+    """
+    module_path = get_repo_root_path() / "deploy" / "sync_upstream.py"
+    if not module_path.is_file():
+        logger.warning(f"[Sync] 未找到 {module_path}，跳过上游同步。")
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("baas_sync_upstream", module_path)
+        if spec is None or spec.loader is None:
+            logger.warning(f"[Sync] 无法加载 {module_path}，跳过上游同步。")
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:
+        logger.warning(f"[Sync] 加载 {module_path} 失败：{e}，跳过上游同步。")
+        return None
+
+
+def sync_upstream_before_start():
+    """启动前把官方上游合并进当前分支并推送到 Fork。
+
+    Returns:
+        bool: True 表示可以继续启动；False 表示存在代码冲突，应阻断启动。
+    """
+    module = load_sync_upstream()
+    if module is None:
+        return True
+    return module.sync_with_upstream(str(get_repo_root_path()))
+
+
+def is_local_ahead_of_origin(_repo, branch=REPO_BRANCH):
+    """判断本地分支是否领先 origin/<branch>（存在未推送的提交）。
+
+    Args:
+        _repo: 已打开的 pygit2 仓库对象。
+        branch: 待检查的分支名。
+
+    Returns:
+        bool: 本地领先返回 True；远程引用缺失或无法判断时返回 False。
+    """
+    remote_ref = _repo.references.get(f"refs/remotes/origin/{branch}")
+    if remote_ref is None:
+        return False
+    try:
+        head = _repo.head.target
+        if head == remote_ref.target:
+            return False
+        try:
+            ahead, _behind = _repo.ahead_behind(head, remote_ref.target)
+            return ahead > 0
+        except AttributeError:
+            # 老版本 pygit2 没有 ahead_behind：退化成“origin 不是 HEAD 的祖先”
+            return not _repo.descendant_of(remote_ref.target, head)
+    except GitError:
+        return False
+
+
+def get_expected_origin_url():
+    """返回 origin 应当指向的仓库地址。
+
+    配置了 ``General.fork_repo_url`` 时以个人 Fork 为准：本机以 Fork 为发行版，
+    官方仓库只作为 upstream 增量来源。留空则保持官方的原有行为。
+
+    Returns:
+        str: 期望的 origin 地址。
+    """
+    return (G.fork_repo_url or U.REPO_URL_HTTP).strip()
+
+
+def is_fork_mode():
+    """是否启用了个人 Fork 模式。
+
+    Returns:
+        bool: 配置了 ``General.fork_repo_url`` 返回 True。
+    """
+    return bool(str(G.fork_repo_url or "").strip())
+
+
+def get_origin_remote_sha():
+    """读取个人 Fork（origin）当前分支的 SHA。
+
+    与 :meth:`Utils.get_remote_sha` 不同，这里只问 origin，不查官方源：
+    Fork 模式下 Fork 才是这台机器的发行版。
+
+    Returns:
+        str | None: 40 位提交 SHA；读取失败返回 None。
+    """
+    url = get_expected_origin_url()
+    branch = REPO_BRANCH
+    logger.info("<<< Get Fork Remote SHA >>>")
+    logger.info(url)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_repo = pygit2.init_repository(tmp_dir, bare=True)
+    try:
+        remote = tmp_repo.remotes.create_anonymous(url)
+        heads = list_remote_heads(remote)
+    except GitError as e:
+        logger.warning(f"[Fork] get SHA error: {e}")
+        return None
+    target_ref = f"refs/heads/{branch}"
+    sha = heads.get(target_ref)
+    if sha is None:
+        logger.warning(f"[Fork] 远端不存在分支 {target_ref}。")
+    return sha
+
+
+def clone_preferred_repo(local_path):
+    """优先从期望的 origin 地址克隆，失败时回退到官方 U.REPO_URL_HTTP。
+
+    Args:
+        local_path: 克隆目标目录。
+
+    Returns:
+        仓库对象 | None: 全部地址都失败时返回 None。
+    """
+    urls = [get_expected_origin_url()]
+    if U.REPO_URL_HTTP not in urls:
+        urls.append(U.REPO_URL_HTTP)
+    for url in urls:
+        logger.info("Repo URL : " + url)
+        try:
+            return clone_repo(url, local_path)
+        except GitError as e:
+            logger.warning(f"Clone from {url} failed: {e}")
+    return None
+
+
 def check_repo_url(_repo):
     origin = _repo.remotes["origin"]
     logger.info("<<< Repo Remote URL >>>")
     logger.info(origin.url)
 
-    if origin.url != U.REPO_URL_HTTP:
+    expected_url = get_expected_origin_url()
+    if origin.url != expected_url:
         original_url = origin.url
         upstream_backup = {}
         for branch in _repo.branches.local:
@@ -914,9 +1096,9 @@ def check_repo_url(_repo):
 
         try:
             logger.info("<<< Switch Repo Remote URL >>>")
-            logger.info(U.REPO_URL_HTTP)
+            logger.info(expected_url)
             _repo.remotes.delete("origin")
-            new_origin = _repo.remotes.create("origin", U.REPO_URL_HTTP)
+            new_origin = _repo.remotes.create("origin", expected_url)
             for ref in list(_repo.references):
                 if ref.startswith("refs/remotes/origin/"):
                     _repo.references.delete(ref)
@@ -987,10 +1169,19 @@ def git_update_baas():
         gc.collect()
 
         # Reset local branch to remote
-        repo.reset(repo.lookup_reference(f"refs/remotes/origin/{REPO_BRANCH}").target, GIT_RESET_HARD)
+        if is_local_ahead_of_origin(repo):
+            # Fork 模式下 origin 是个人仓库：本地领先说明上一次启动合并了上游
+            # 但推送没成功（或本地还有未推送的个人提交）。这里的 reset --hard
+            # 会把它们整段抹掉，因此跳过，交给下次启动的同步流程补推。
+            logger.warning(
+                f"[Fork] 本地领先 origin/{REPO_BRANCH}（存在未推送提交），"
+                "已跳过本次覆盖式 Git 更新以保护本地提交。"
+            )
+        else:
+            repo.reset(repo.lookup_reference(f"refs/remotes/origin/{REPO_BRANCH}").target, GIT_RESET_HARD)
 
-        # Checkout to master (HEAD points to refs/heads/master)
-        repo.checkout(f"refs/heads/{REPO_BRANCH}")
+            # Checkout to master (HEAD points to refs/heads/master)
+            repo.checkout(f"refs/heads/{REPO_BRANCH}")
         # str(repo.references.get("refs/remotes/origin/master").target)
         local_sha = str(repo.head.target)
         if local_sha == remote_sha:
@@ -1059,6 +1250,15 @@ def clean_up():
 
 
 def pre_check():
+    # 上游同步放在环境检查之前：它只用标准库与系统 git，不依赖 .venv。
+    # 合并结果同时是后面版本比对的本地基线，冲突则直接阻断启动。
+    if not sync_upstream_before_start():
+        logger.critical(
+            "[Sync] 检测到与官方上游仓库的代码冲突，安装与启动流程已阻断。"
+        )
+        logger.critical("[Sync] 解决冲突的方式见上方冲突报告。")
+        exit(1)
+
     if G.runtime_path == "default":
         check_python()
         if G.package_manager == "pdm":
@@ -1101,7 +1301,16 @@ def get_update_type():
 
     assert (len(local_sha) == 40)
     mirrorc_inst.set_version(local_sha)
-    remote_sha = Utils.get_remote_sha()
+    if is_fork_mode():
+        # Fork 模式：本机以个人 Fork 为发行版，版本比对也应当对着 Fork，
+        # 官方更新由启动时的 sync_upstream 合并进 Fork 后再推过来。
+        remote_sha = get_origin_remote_sha()
+        if remote_sha is None:
+            logger.warning("[Fork] 无法读取个人 Fork 的版本，跳过本次版本比对。")
+            update_type = "latest"
+            return
+    else:
+        remote_sha = Utils.get_remote_sha()
     assert (len(remote_sha) == 40)
     logger.info(f"local_sha : {local_sha}")
     logger.info(f"remote_sha: {remote_sha}")

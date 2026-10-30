@@ -35,6 +35,87 @@ ICON_DIR = 'gui/assets/logo.png'
 LAST_NOTICE_TIME = 0
 
 
+def _load_sync_upstream_module():
+    """加载仓库根目录下的 deploy/sync_upstream.py。
+
+    该模块只用标准库与系统 git，启动到这一步时不依赖任何 BAAS 配置。
+    文件缺失或加载失败都视为“无需同步”，不能让上游同步挡住正常启动。
+
+    Returns:
+        module | None: 加载成功返回模块对象。
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    module_path = os.path.join(root, 'deploy', 'sync_upstream.py')
+    if not os.path.isfile(module_path):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('baas_sync_upstream', module_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:
+        print(f'[Sync] 加载同步模块失败：{e}')
+        return None
+
+
+def _notify_sync_conflict(root, conflicts):
+    """冲突阻断启动时留下用户可见的提示。
+
+    同步模块已经把完整报告写进仓库的 log/sync_upstream_conflict.log；Windows
+    上 BAAS 由 pythonw.exe 启动、控制台不可见，所以这里再补一个原生对话框，
+    否则用户只会觉得“程序没打开”。
+
+    Args:
+        root: 仓库根目录。
+        conflicts: 冲突文件相对路径列表。
+    """
+    lines = ['BAAS 启动被拦截：与官方上游仓库存在代码冲突。', '', '冲突文件：']
+    lines += [f'  - {p}' for p in conflicts] or ['  （未取到冲突文件，请执行 git status）']
+    lines += [
+        '',
+        '完整报告：log/sync_upstream_conflict.log',
+        '',
+        '处理方式：',
+        '  1. 在 BAAS 目录执行 git status 查看冲突',
+        '  2. 结合两边上下文保留双方功能，git add <file> && git commit',
+        '  3. 放弃本次合并：git merge --abort',
+        '  4. 合并前的本地 HEAD 备份在 refs/baas-backup/auto-sync',
+    ]
+    message = '\n'.join(lines)
+
+    print(message)
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None, message, 'BAAS 启动拦截：上游代码冲突', 0x10
+            )
+        except Exception as e:
+            print(f'[Sync] 弹窗失败：{e}')
+
+
+def sync_upstream_before_start():
+    """启动前把官方上游合并进当前分支并推送到个人 Fork。
+
+    Returns:
+        bool: True 表示可以继续启动；False 表示存在冲突，应阻断启动。
+    """
+    # 启动器（BlueArchiveAutoScript.exe / Start_BAAS.bat）已经同步过时不再重复
+    if os.environ.get('BAAS_SYNCED') == '1':
+        return True
+    root = os.path.dirname(os.path.abspath(__file__))
+    module = _load_sync_upstream_module()
+    if module is None:
+        return True
+    ok = module.sync_with_upstream(root)
+    if not ok:
+        _notify_sync_conflict(root, list(getattr(module, 'LAST_CONFLICTS', None) or []))
+    return ok
+
+
 def delete_deprecated_config(file_name, config_name=None):
     # delete useless config file
     pre = 'config/'
@@ -647,6 +728,9 @@ if __name__ == '__main__':
     # pa=Main()
     # pa._init_emulator()
     # pa.solve("arena")
+    # 启动即同步官方上游：合并进当前分支并推送到个人 Fork，冲突则拦截启动
+    if not sync_upstream_before_start():
+        sys.exit(1)
     deprecated_configs = [
         "display.json",
         "event.json",
