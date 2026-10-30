@@ -82,5 +82,3 @@ GUI预览图：
 ## [致谢名单](https://baas.wiki/thanks)
 
 ![Contributors](https://contrib.rocks/image?repo=pur1fying/blue_archive_auto_script)
-
-<!-- fork-sync-verify: 20261031-002952 -->
