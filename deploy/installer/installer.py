@@ -1108,6 +1108,9 @@ class AppLauncher:
 
         python_exec = self._get_python_executable()
         env = __env__.copy()
+        if _upstream_sync_done:
+            # 本进程已经同步过，window.py 启动时不必再来一遍。
+            env["BAAS_SYNCED"] = "1"
 
         if __system__ == "Linux" and self.cfg.General.runtime_path == "default":
             env["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(
@@ -1264,7 +1267,13 @@ class Utils:
 
 # ==================== Main Execution Flow ====================
 
+# 本进程是否已经完成过一次上游同步：拉起 window.py 时用它打 BAAS_SYNCED 标记，
+# 避免同一次启动把同步跑两遍。
+_upstream_sync_done = False
+
+
 def main():
+    global _upstream_sync_done
     # 1. Initialize Configuration
     config = GlobalConfig()
 
@@ -1280,6 +1289,7 @@ def main():
                 logger.critical("[Sync] 检测到与官方上游仓库的代码冲突，安装与启动流程已阻断。")
                 logger.critical("[Sync] 解决冲突的方式见上方冲突报告。")
                 Utils.error_tackle()
+            _upstream_sync_done = True
 
         if not config.General.launch:
             # Environment Setup
