@@ -33,7 +33,7 @@
 | `deploy/sync_upstream.py` | 同步器本体。只用标准库 + 系统 `git`，不碰 BAAS 配置，可在 .venv 就绪前运行 |
 | `Start_BAAS.bat` | 启动器：先同步，再拉起 `BlueArchiveAutoScript*.exe`（没有 exe 就直接跑 `window.py`） |
 | `window.py` | GUI 入口。每次 GUI 启动都会先跑一次同步（`BAAS_SYNCED=1` 时跳过，避免同一次启动跑两遍） |
-| `deploy/installer/installer.py` | 安装器/更新器。`pre_check` 先同步；`git_update_baas` 在本地领先 origin 时拒绝做覆盖式 `reset --hard` |
+| `deploy/installer/installer.py` | 安装器/更新器。`main()` 里最先跑上游同步，冲突即阻断；`GitOperationHandler.update()` 在本地领先 origin 时跳过覆盖式 `reset --hard` |
 | `develop_tools/test_sync_upstream.py` | 回归测试（9 项，纯临时仓库，不联网） |
 
 ## 3. 每次启动发生了什么
@@ -123,3 +123,13 @@ python deploy/sync_upstream.py                      # 真跑一次，看输出
 
 真实链路验证过一次：往 Fork 推一个提交 → 副本启动同步 → 副本 HEAD 与文件内容跟着变 →
 回滚后再同步一次 → 副本同步回到回滚版。全程没动过副本的工作区文件。
+
+## 6. 已知的结构性冲突
+
+官方把 `deploy/installer/installer.py` 重构成类结构（`GitOperationHandler` / `UpdateOrchestrator` / `AppLauncher`，`DEFAULT_SETTINGS` 移到 `toml_config.py`，远程 SHA 改用 `git_backend.remote_branch_sha`）之后，Fork 侧的同步/防覆盖逻辑必须重新焊到新类上，不能靠保留旧函数混过去：
+
+* 同步入口在 `main()` 最前面，早于环境检查（只用标准库与系统 `git`）；
+* Fork 模式下 `get_remote_sha` 只问个人 Fork，读不到才回退官方渠道；
+* `update(protect_unpushed=...)` 保护尚未推送到 Fork 的提交；
+* MirrorC 成功后**不删** `.git`（合并与推送链路依赖它）；
+* `toml_config.DEFAULT_SETTINGS` 里保留 `fork_repo_url`，留空即完全退化为官方行为。
