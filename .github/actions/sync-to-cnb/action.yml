@@ -1,0 +1,21 @@
+name: Sync to CNB
+description: Sync current GitHub branches and tags to CNB without rewriting history.
+
+inputs:
+  target-url:
+    description: CNB repository URL to sync to.
+    required: true
+  password:
+    description: CNB token with write access to the target repository.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Sync current branches and tags to CNB
+      shell: bash
+      env:
+        CNB_REPO_URL: ${{ inputs.target-url }}
+        CNB_SYNC_TOKEN: ${{ inputs.password }}
+        GIT_TERMINAL_PROMPT: "0"
+      run: bash "$GITHUB_ACTION_PATH/sync.sh"
