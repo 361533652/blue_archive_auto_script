@@ -37,6 +37,24 @@ import sys
 import time
 from typing import List, Optional
 
+# Windows 上 pythonw.exe 是 GUI 子系统、没有控制台，而 git.exe 是控制台程序：
+# 父进程没有控制台时，每个 git 子进程都会被系统分配一个**新的控制台窗口**，
+# 于是一次启动里十几次 git 调用就表现为十几个一闪而过的黑窗。这里统一让所有
+# git 子进程以「不创建控制台窗口」的方式启动；从 .bat 启动（父进程已有控制台）
+# 时同样无害，因为输出本来就由 capture_output 接管。
+_NO_WINDOW_KWARGS = {}
+if sys.platform == "win32":
+    try:
+        _startupinfo = subprocess.STARTUPINFO()
+        _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        _startupinfo.wShowWindow = subprocess.SW_HIDE
+        _NO_WINDOW_KWARGS = {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": _startupinfo,
+        }
+    except Exception:  # 极老的解释器/受限环境：退化为原行为
+        _NO_WINDOW_KWARGS = {}
+
 # 兼容 Windows 控制台（GBK 代码页）打印中文与符号
 if sys.platform == "win32":
     try:
@@ -162,6 +180,7 @@ def run_git(
         encoding="utf-8",
         errors="replace",
         check=check,
+        **_NO_WINDOW_KWARGS,
     )
 
 
@@ -181,6 +200,7 @@ def find_repo_root(repo_dir: Optional[str] = None) -> Optional[str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        **_NO_WINDOW_KWARGS,
     )
     if res.returncode != 0:
         return None
